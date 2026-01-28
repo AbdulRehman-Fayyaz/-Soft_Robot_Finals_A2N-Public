@@ -1,0 +1,228 @@
+/*
+  Mega2560 — Mixed Differential Read:
+    - HW differential ×200 (valid pairs A0..A7):
+        S1: (A1 - A0) ×200
+        S2: (A3 - A2) ×200
+    - SW differential (single-ended subtraction) on A8..A11:
+        S3: (A9 - A8)    // software diff
+        S4: (A11 - A10)  // software diff
+
+  Reference: AVcc (~5V)
+  Prints P1..P4 (psi) every 50 ms. Enable DEBUG_RAW for raw diagnostics.
+*/
+
+#include <avr/io.h>
+
+// =================== User Options ===================
+#define SERIAL_BAUD     9600
+#define PRINT_PERIOD_MS 50
+#define DEBUG_RAW       0      // 1: also print codes/volts
+#define CLAMP_NEGATIVE  1      // clamp psi < 0 to 0
+#define N_DUMMY         3      // dummy conversions after HW channel switch
+#define N_AVG_HW        32     // average count for HW diff
+#define N_AVG_SW        16     // average count per pin for SW diff
+
+// Pressure conversion (example TBP 30psi @5V): ~0.87 mV/psi
+static inline float vdiff_to_psi(float vdiff_volts) {
+  float mV = vdiff_volts * 1000.0f;
+  return mV / 0.87f;
+}
+
+// =================== PWM (fixed 50 Hz) ===================
+int prescaler = 256;
+float potDC1 = 0, potDC2 = 0, potDC3 = 0, potDC4 = 0;
+const float FIXED_PWM_FREQ = 50.0;
+
+const int SW1=50, SW2=51, SW3=52, SW4=53;
+const int PWM1=5,  PWM2=6,  PWM3=7,  PWM4=8;
+
+const int POT1 = A12, POT2 = A13, POT3 = A14, POT4 = A15;
+
+static inline float clampPct(float x){ return x<0?0:(x>100?100:x); }
+
+void pPWM(float pwmfreq, float pwmDC1, float pwmDC2, float pwmDC3, float pwmDC4) {
+  ICR3 = F_CPU / (prescaler * pwmfreq * 2);
+  ICR4 = F_CPU / (prescaler * pwmfreq * 2);
+
+  pwmDC1 = clampPct(pwmDC1);
+  pwmDC2 = clampPct(pwmDC2);
+  pwmDC3 = clampPct(pwmDC3);
+  pwmDC4 = clampPct(pwmDC4);
+
+  OCR3A = (uint16_t)(ICR3 * (pwmDC1 * 0.01f)); // D5  (OC3A)
+  OCR4A = (uint16_t)(ICR4 * (pwmDC2 * 0.01f)); // D6  (OC4A)
+  OCR4B = (uint16_t)(ICR4 * (pwmDC3 * 0.01f)); // D7  (OC4B)
+  OCR4C = (uint16_t)(ICR4 * (pwmDC4 * 0.01f)); // D8  (OC4C)
+}
+
+// =================== ADC: HW Differential (×200) ===================
+// MUX codes (datasheet) for ×200: (A1-A0)=0b01011, (A3-A2)=0b01111
+#define MUX200_A1A0 0b01011
+#define MUX200_A3A2 0b01111
+
+// AVcc reference init; right-adjusted; disable digital on A0..A7 for noise
+static inline void adc_init_AVcc() {
+  ADMUX  = (1<<REFS0);  // AVcc ref
+  ADCSRB = 0;           // MUX5=0 for A0..A7
+  ADCSRA = (1<<ADEN) | (1<<ADPS2)|(1<<ADPS1)|(1<<ADPS0); // prescale=128
+  DIDR0 |= (1<<ADC0D)|(1<<ADC1D)|(1<<ADC2D)|(1<<ADC3D)|
+           (1<<ADC4D)|(1<<ADC5D)|(1<<ADC6D)|(1<<ADC7D);
+}
+
+// Read HW differential channel; returns signed 10-bit code (-512..+511)
+static inline int16_t adc_read_diff_hw(uint8_t mux4_0) {
+  ADMUX  = (1<<REFS0) | (mux4_0 & 0x1F);
+  ADCSRB = 0; // MUX5=0
+
+  for (int i=0; i<N_DUMMY; i++) {
+    ADCSRA |= (1<<ADSC);
+    while (ADCSRA & (1<<ADSC));
+    (void)ADCL; (void)ADCH;
+  }
+
+  long acc = 0;
+  for (int i=0; i<N_AVG_HW; i++) {
+    ADCSRA |= (1<<ADSC);
+    while (ADCSRA & (1<<ADSC));
+    uint8_t low  = ADCL;
+    uint8_t high = ADCH;
+    int16_t code = (high<<8) | low;     // 0..1023
+    if (code & 0x0200) code -= 1024;    // sign-extend → -512..+511
+    acc += code;
+  }
+  return (int16_t)(acc / N_AVG_HW);
+}
+
+// Convert HW diff signed code to sensor-level Vdiff (VREF=5V, gain=200)
+static inline float code_to_vdiff_hw(int16_t code) {
+  const float VREF = 5.0f; // AVcc
+  const int   GAIN = 200;
+  return ((float)code / 512.0f) * (VREF / (float)GAIN);
+}
+
+// =================== ADC: SW Differential on A8..A11 ===================
+// Average single-ended analogRead on a pin (returns 0..1023)
+static inline int analogReadAvg(uint8_t pin, int n=N_AVG_SW) {
+  long acc=0;
+  for (int i=0;i<n;i++) acc += analogRead(pin);
+  return (int)(acc / n);
+}
+
+// Read software differential: Vdiff = (Vplus - Vminus), using analogRead (AVcc)
+static inline float read_vdiff_sw(uint8_t pin_plus, uint8_t pin_minus) {
+  // Ensure analogReference(DEFAULT) once (AVcc)
+  static bool ref_set = false;
+  if (!ref_set) { analogReference(DEFAULT); ref_set = true; }
+
+  int rp = analogReadAvg(pin_plus);
+  int rm = analogReadAvg(pin_minus);
+  int diff_code = rp - rm;                  // -1023..+1023 approx
+
+  const float VREF = 5.0f;                  // AVcc
+  float vdiff = (diff_code * VREF) / 1023.0f; // volts at sensor
+#if DEBUG_RAW
+  Serial.print("[SW rp="); Serial.print(rp);
+  Serial.print(" rm="); Serial.print(rm);
+  Serial.print(" diff="); Serial.print(diff_code);
+  Serial.print(" v="); Serial.print(vdiff,6);
+  Serial.print("] ");
+#endif
+  return vdiff;
+}
+
+// =================== Offsets ===================
+int16_t off_hw_s1=0, off_hw_s2=0;      // codes for HW diff
+float   off_sw_s3=0.0f, off_sw_s4=0.0f; // volts for SW diff
+
+// =================== Setup ===================
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+
+  // PWM pins/mode
+  pinMode(SW1, INPUT); pinMode(SW2, INPUT);
+  pinMode(SW3, INPUT); pinMode(SW4, INPUT);
+
+  pinMode(PWM1, OUTPUT); pinMode(PWM2, OUTPUT);
+  pinMode(PWM3, OUTPUT); pinMode(PWM4, OUTPUT);
+
+  int eightOnes = 255;
+  TCCR3A &= ~eightOnes; TCCR3B &= ~eightOnes;
+  TCCR4A &= ~eightOnes; TCCR4B &= ~eightOnes;
+
+  TCCR3A = _BV(COM3A1);
+  TCCR3B = _BV(WGM33) | _BV(CS32);
+  TCCR4A = _BV(COM4A1) | _BV(COM4B1) | _BV(COM4C1);
+  TCCR4B = _BV(WGM43) | _BV(CS42);
+
+  ICR3 = F_CPU / (prescaler * FIXED_PWM_FREQ * 2);
+  ICR4 = F_CPU / (prescaler * FIXED_PWM_FREQ * 2);
+
+  // ADC init (HW path) + offsets (ensure no pressure now)
+  adc_init_AVcc();
+  delay(300);
+
+  off_hw_s1 = adc_read_diff_hw(MUX200_A1A0);
+  off_hw_s2 = adc_read_diff_hw(MUX200_A3A2);
+
+  // SW path offsets (volts)
+  off_sw_s3 = read_vdiff_sw(A9,  A8);   // (A9 - A8)
+  off_sw_s4 = read_vdiff_sw(A11, A10);  // (A11 - A10)
+
+  Serial.print(F("Offsets -> HW: "));
+  Serial.print(off_hw_s1); Serial.print('\t');
+  Serial.print(off_hw_s2);
+  Serial.print(F("  |  SW (V): "));
+  Serial.print(off_sw_s3,6); Serial.print('\t');
+  Serial.println(off_sw_s4,6);
+
+  Serial.println(F("P1\tP2\tP3\tP4  (psi)"));
+}
+
+// =================== Loop ===================
+void loop() {
+  // Pot to PWM (when switch HIGH)
+  potDC1 = potDC2 = potDC3 = potDC4 = 0;
+  if (digitalRead(SW1)==HIGH) potDC1 = analogRead(POT1) * 100.0 / 1023.0;
+  if (digitalRead(SW2)==HIGH) potDC2 = analogRead(POT2) * 100.0 / 1023.0;
+  if (digitalRead(SW3)==HIGH) potDC3 = analogRead(POT3) * 100.0 / 1023.0;
+  if (digitalRead(SW4)==HIGH) potDC4 = analogRead(POT4) * 100.0 / 1023.0;
+
+  pPWM(FIXED_PWM_FREQ, potDC1, potDC2, potDC3, potDC4);
+
+  // --- Read S1,S2 via HW diff ×200 (codes -> volts) ---
+  int16_t c1 = adc_read_diff_hw(MUX200_A1A0) - off_hw_s1;
+  int16_t c2 = adc_read_diff_hw(MUX200_A3A2) - off_hw_s2;
+  float v1 = code_to_vdiff_hw(c1);
+  float v2 = code_to_vdiff_hw(c2);
+
+  // --- Read S3,S4 via SW diff on A8..A11 (volts) ---
+  float v3 = read_vdiff_sw(A9,  A8)  - off_sw_s3;  // (A9 - A8)
+  float v4 = read_vdiff_sw(A11, A10) - off_sw_s4;  // (A11 - A10)
+
+  // Convert to psi
+  float P1 = vdiff_to_psi(v1);
+  float P2 = vdiff_to_psi(v2);
+  float P3 = vdiff_to_psi(v3);
+  float P4 = vdiff_to_psi(v4);
+
+#if CLAMP_NEGATIVE
+  if (P1 < 0) P1 = 0;
+  if (P2 < 0) P2 = 0;
+  if (P3 < 0) P3 = 0;
+  if (P4 < 0) P4 = 0;
+#endif
+
+#if DEBUG_RAW
+  Serial.print("HW c1="); Serial.print(c1); Serial.print(" v1="); Serial.print(v1,6); Serial.print(" ");
+  Serial.print("HW c2="); Serial.print(c2); Serial.print(" v2="); Serial.print(v2,6); Serial.print(" | ");
+  Serial.print("SW v3="); Serial.print(v3,6); Serial.print(" ");
+  Serial.print("SW v4="); Serial.print(v4,6); Serial.print(" | ");
+#endif
+
+  Serial.print(P1,2); Serial.print('\t');
+  Serial.print(P2,2); Serial.print('\t');
+  Serial.print(P3,2); Serial.print('\t');
+  Serial.println(P4,2);
+
+  delay(PRINT_PERIOD_MS);
+}
