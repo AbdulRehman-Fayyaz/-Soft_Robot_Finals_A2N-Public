@@ -12,8 +12,8 @@ const int pulseStop = 1500;
 
 // Potentiometer calibration
 const int potMin    = 0;
-const int potMax    = 700;
-const int potCenter = 350;
+const int potMax    = 1023;
+const int potCenter = 512;
 
 void setup() {
   servo.attach(servoPin);
